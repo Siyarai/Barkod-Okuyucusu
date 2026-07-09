@@ -45,7 +45,12 @@ class BufeSistemi(ctk.CTk):
         self.toplam_fiyat   = 0   # kuruş (integer)
         self.toplam_maliyet = 0   # kuruş (integer)
         self.son_islem      = None  # sadece EN SON tamamlanan satış iptal edilebilir
+        self.sepet_gorunum  = []    # self.sepet ile hizalı görünüm metinleri (saat, stok uyarısı)
         self.secili_urunler = set() # ürün listesinde checkbox ile seçilen barkodlar
+        # Bekletilen satışlar (park): uygulama kapanınca kaybolur — bilinçli tercih,
+        # Son Satışı İptal Et ile aynı mantık (DB'ye yazılmaz)
+        self.bekleyen_satislar = {}
+        self.bekleyen_sayac    = 0
         self.son_toplu_degisiklik = None  # son toplu fiyat değişikliğinin eski değerleri (tek seviyeli undo)
 
         self.grid_columnconfigure(0, weight=1)
@@ -158,6 +163,14 @@ class BufeSistemi(ctk.CTk):
         """Kullanıcı girdisini (TL, virgül veya nokta) kuruş integer'ına çevirir."""
         return int(round(float(metin.replace(",", ".")) * 100))
 
+    @staticmethod
+    def _isim_normalize(s: str) -> str:
+        """İsim karşılaştırması için normalize eder: Türkçe İ/I uyumu.
+        "ali".upper() → "ALI" (noktasız), kayıtta "ALİŞAN" (noktalı İ) —
+        iki tarafı da noktasız I'ya indirger. Yalnızca karşılaştırma için;
+        gösterilen/DB'deki isim değişmez."""
+        return s.upper().replace("İ", "I")
+
     def ses_cikar(self, tur="ok"):
         if winsound:
             freq = 1500 if tur == "ok" else 500
@@ -203,10 +216,10 @@ class BufeSistemi(ctk.CTk):
 
         ctk.CTkLabel(sol_panel, text="🧾 Sepet / Fiş Listesi",
                      font=(FONT_ANA, 18, "bold"), text_color="#bbb").pack(pady=10)
-        self.liste_alani = ctk.CTkTextbox(sol_panel, font=("Consolas", 16),
-                                          fg_color="#222", text_color="white", corner_radius=10)
-        self.liste_alani.pack(pady=5, padx=10, fill="both", expand=True)
-        self.liste_alani.configure(state="disabled")
+        # Satır bazlı sepet: her kalemin yanında ✕ (tekil silme) butonu var
+        self.sepet_liste_frame = ctk.CTkScrollableFrame(sol_panel, fg_color="#222",
+                                                        corner_radius=10)
+        self.sepet_liste_frame.pack(pady=5, padx=10, fill="both", expand=True)
 
         sag_panel = ctk.CTkFrame(self.sekme_satis, fg_color="transparent")
         sag_panel.grid(row=0, column=1, sticky="nsew")
@@ -261,6 +274,21 @@ class BufeSistemi(ctk.CTk):
                                            corner_radius=15, command=self.sepeti_temizle)
         self.temizle_buton.pack(fill="x", pady=5)
 
+        beklet_frame = ctk.CTkFrame(sag_panel, fg_color="transparent")
+        beklet_frame.pack(fill="x", pady=(0, 5))
+        self.beklet_buton = ctk.CTkButton(beklet_frame, text="⏸ Müşteriyi Beklet",
+                                          font=(FONT_ANA, 13, "bold"), height=35,
+                                          fg_color="#555", hover_color="#777",
+                                          corner_radius=15, state="disabled",
+                                          command=self.musteri_beklet)
+        self.beklet_buton.pack(side="left", expand=True, fill="x", padx=(0, 3))
+        self.bekleyenler_buton = ctk.CTkButton(beklet_frame, text="⏸ Bekleyenler (0)",
+                                               font=(FONT_ANA, 13, "bold"), height=35,
+                                               fg_color="#555", hover_color="#777",
+                                               corner_radius=15, state="disabled",
+                                               command=self.bekleyenler_popup)
+        self.bekleyenler_buton.pack(side="right", expand=True, fill="x", padx=(3, 0))
+
         self.iptal_buton = ctk.CTkButton(sag_panel, text="↩️ Son Satışı İptal Et",
                                           font=(FONT_ANA, 13, "bold"), height=35,
                                           fg_color="#555", hover_color="#777",
@@ -279,6 +307,11 @@ class BufeSistemi(ctk.CTk):
 
         ctk.CTkLabel(pencere, text="📋 Kayıtlı Müşteriler",
                      font=(FONT_ANA, 18, "bold"), text_color=RENK_SARI).pack(pady=(20, 5))
+
+        arama_entry = ctk.CTkEntry(pencere, placeholder_text="🔍 Müşteri Ara...",
+                                   font=(FONT_ANA, 14), height=35)
+        arama_entry.pack(fill="x", padx=20, pady=(0, 5))
+
         liste_frame = ctk.CTkScrollableFrame(pencere, height=180, fg_color="#222")
         liste_frame.pack(fill="x", padx=20, pady=5)
 
@@ -336,16 +369,29 @@ class BufeSistemi(ctk.CTk):
             pencere.destroy()
             self.ses_cikar("ok")
 
-        if musteriler:
-            for (m_isim,) in musteriler:
-                btn = ctk.CTkButton(liste_frame, text=f"{m_isim}",
-                                    font=(FONT_ANA, 14, "bold"), fg_color=RENK_PANEL,
-                                    hover_color="#444", height=35, anchor="w",
-                                    command=lambda n=m_isim: onayla(n))
-                btn.pack(fill="x", pady=3, padx=5)
-        else:
-            ctk.CTkLabel(liste_frame, text="Henüz kayıtlı müşteri yok.",
-                         font=(FONT_ANA, 14), text_color="#aaa").pack(pady=20)
+        def musteri_listesi_ciz(event=None):
+            for w in liste_frame.winfo_children():
+                w.destroy()
+            aranan = self._isim_normalize(arama_entry.get().strip())
+            eslesenler = [m for (m,) in musteriler
+                          if aranan in self._isim_normalize(m)] if aranan \
+                         else [m for (m,) in musteriler]
+            if eslesenler:
+                for m_isim in eslesenler:
+                    btn = ctk.CTkButton(liste_frame, text=f"{m_isim}",
+                                        font=(FONT_ANA, 14, "bold"), fg_color=RENK_PANEL,
+                                        hover_color="#444", height=35, anchor="w",
+                                        command=lambda n=m_isim: onayla(n))
+                    btn.pack(fill="x", pady=3, padx=5)
+            elif musteriler:
+                ctk.CTkLabel(liste_frame, text="Eşleşen müşteri bulunamadı.",
+                             font=(FONT_ANA, 14), text_color="#aaa").pack(pady=20)
+            else:
+                ctk.CTkLabel(liste_frame, text="Henüz kayıtlı müşteri yok.",
+                             font=(FONT_ANA, 14), text_color="#aaa").pack(pady=20)
+
+        arama_entry.bind("<KeyRelease>", musteri_listesi_ciz)
+        musteri_listesi_ciz()
 
         ctk.CTkLabel(pencere, text="➕ Veya Yeni Müşteri Ekle:",
                      font=(FONT_ANA, 16, "bold"), text_color=RENK_MAVI).pack(pady=(20, 5))
@@ -410,12 +456,11 @@ class BufeSistemi(ctk.CTk):
 
             stok_uyarisi = f" (Kalan: {stok - adet})" if stok - adet < 10 else ""
             zaman = datetime.now().strftime("%H:%M")
-            satir = f"[{zaman}] {isim[:15]:<15} x{adet:<2} {self.format_tl(toplam_satis):>9}{stok_uyarisi}\n"
+            satir = f"[{zaman}] {isim[:15]:<15} x{adet:<2} {self.format_tl(toplam_satis):>9}{stok_uyarisi}"
 
-            self.liste_alani.configure(state="normal")
-            self.liste_alani.insert("end", satir)
-            self.liste_alani.configure(state="disabled")
-            self.liste_alani.see("end")
+            self.sepet_gorunum.append(satir)
+            self._sepet_gorunumu_yenile()
+            self._beklet_butonlari_guncelle()
             self.toplam_etiketi.configure(text=self.format_tl(self.toplam_fiyat), text_color=RENK_YESIL)
             self.satis_adet.delete(0, "end")
             self.satis_adet.insert(0, "1")
@@ -424,6 +469,51 @@ class BufeSistemi(ctk.CTk):
             self.toplam_etiketi.configure(text="BULUNAMADI!", text_color=RENK_KIRMIZI)
             self.after(1500, lambda: self.toplam_etiketi.configure(
                 text=self.format_tl(self.toplam_fiyat), text_color=RENK_YESIL))
+
+    def _sepet_gorunumu_yenile(self, mesaj=None):
+        """Sepet listesini self.sepet/self.sepet_gorunum'dan yeniden çizer."""
+        for w in self.sepet_liste_frame.winfo_children():
+            w.destroy()
+
+        if mesaj:
+            ctk.CTkLabel(self.sepet_liste_frame, text=mesaj,
+                         font=("Consolas", 15), text_color="#aaa").pack(pady=10)
+            return
+
+        for i, metin in enumerate(self.sepet_gorunum):
+            satir = ctk.CTkFrame(self.sepet_liste_frame, fg_color="transparent")
+            satir.pack(fill="x", pady=1)
+            ctk.CTkLabel(satir, text=metin, font=("Consolas", 15),
+                         text_color="white", anchor="w").pack(side="left", padx=(5, 0))
+            ctk.CTkButton(satir, text="✕", width=28, height=24,
+                          font=(FONT_ANA, 12, "bold"),
+                          fg_color="transparent", hover_color=RENK_KIRMIZI,
+                          text_color="#888",
+                          command=lambda idx=i: self.sepetten_kalem_sil(idx)).pack(
+                              side="right", padx=(0, 5))
+
+        # Son eklenen satır görünür kalsın
+        self.after(50, lambda: self._sepet_sona_kaydir())
+
+    def _sepet_sona_kaydir(self):
+        try:
+            self.sepet_liste_frame._parent_canvas.yview_moveto(1.0)
+        except Exception:
+            pass  # CTk iç API'si değişirse kaydırma sessizce atlanır
+
+    def sepetten_kalem_sil(self, index):
+        """Onaylanmamış sepetten tek kalemi çıkarır. DB'ye/stoğa dokunmaz —
+        henüz commit edilmiş bir şey yok, yalnızca bellekteki sepet düzeltiliyor."""
+        if index >= len(self.sepet):
+            return
+        _, _, toplam_alis, toplam_satis, _ = self.sepet.pop(index)
+        self.sepet_gorunum.pop(index)
+        self.toplam_fiyat   -= toplam_satis
+        self.toplam_maliyet -= toplam_alis
+        self._sepet_gorunumu_yenile()
+        self._beklet_butonlari_guncelle()
+        self.toplam_etiketi.configure(text=self.format_tl(self.toplam_fiyat),
+                                      text_color=RENK_YESIL)
 
     def _satisi_isle(self, sepet, toplam_fiyat, toplam_maliyet):
         """Günlük ciro/kar ve ürün stok/satilan_adet güncellemesini yapar. commit() çağırmaz."""
@@ -560,14 +650,156 @@ class BufeSistemi(ctk.CTk):
 
     def sepeti_temizle(self, tamamen=False):
         self.sepet.clear()
+        self.sepet_gorunum.clear()
         self.toplam_fiyat   = 0
         self.toplam_maliyet = 0
-        self.liste_alani.configure(state="normal")
-        self.liste_alani.delete("1.0", "end")
-        if not tamamen:
-            self.liste_alani.insert("end", "--- İŞLEM İPTAL EDİLDİ ---\n")
-        self.liste_alani.configure(state="disabled")
+        self._sepet_gorunumu_yenile(
+            mesaj=None if tamamen else "--- İŞLEM İPTAL EDİLDİ ---")
         self.toplam_etiketi.configure(text=self.format_tl(0), text_color=RENK_YESIL)
+        self._beklet_butonlari_guncelle()
+
+    # =========================================================
+    # 1b. MÜŞTERİYİ BEKLET (SATIŞI PARK ET)
+    # =========================================================
+    def _beklet_butonlari_guncelle(self):
+        """Beklet butonu sepet doluyken, Bekleyenler butonu bekleyen varken aktif."""
+        self.beklet_buton.configure(
+            state="normal" if self.sepet else "disabled")
+        n = len(self.bekleyen_satislar)
+        self.bekleyenler_buton.configure(
+            text=f"⏸ Bekleyenler ({n})",
+            state="normal" if n > 0 else "disabled")
+
+    def musteri_beklet(self):
+        if not self.sepet:
+            return
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Müşteriyi Beklet")
+        pencere.geometry("380x220")
+        pencere.attributes("-topmost", True)
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="⏸ Satış Bekletiliyor",
+                     font=(FONT_ANA, 18, "bold"), text_color=RENK_MAVI).pack(pady=(25, 5))
+        ctk.CTkLabel(pencere, text="Etiket / not (boş bırakılabilir):",
+                     font=(FONT_ANA, 13)).pack(pady=(5, 5))
+        etiket_entry = ctk.CTkEntry(pencere, placeholder_text="örn. Ahmet, 2. masa...",
+                                    font=(FONT_ANA, 14), justify="center", height=36)
+        etiket_entry.pack(pady=5, padx=40, fill="x")
+        etiket_entry.focus()
+
+        def beklet():
+            self.bekleyen_sayac += 1
+            etiket = etiket_entry.get().strip() or f"Bekleyen #{self.bekleyen_sayac}"
+            self.bekleyen_satislar[self.bekleyen_sayac] = {
+                "sepet": list(self.sepet),            # kopya — referans değil
+                "gorunum": list(self.sepet_gorunum),  # fiş satırları da geri gelsin
+                "toplam_fiyat": self.toplam_fiyat,
+                "toplam_maliyet": self.toplam_maliyet,
+                "etiket": etiket,
+                "zaman": datetime.now().strftime("%H:%M"),
+            }
+            pencere.destroy()
+            # Ekranı sıfırla — DB'ye hiçbir şey yazılmıyor, satış commit edilmedi
+            self.sepeti_temizle(tamamen=True)
+            self.satis_barkod.focus()
+
+        etiket_entry.bind("<Return>", lambda e: beklet())
+        ctk.CTkButton(pencere, text="⏸ Beklet", fg_color=RENK_MAVI, hover_color="#2980b9",
+                      font=(FONT_ANA, 14, "bold"), height=38,
+                      command=beklet).pack(pady=15, padx=40, fill="x")
+
+    def bekleyenler_popup(self):
+        if not self.bekleyen_satislar:
+            return
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Bekleyen Satışlar")
+        pencere.geometry("480x420")
+        pencere.attributes("-topmost", True)
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="⏸ Bekleyen Satışlar",
+                     font=(FONT_ANA, 18, "bold"), text_color=RENK_MAVI).pack(pady=(20, 5))
+        liste_frame = ctk.CTkScrollableFrame(pencere, fg_color="#222")
+        liste_frame.pack(fill="both", expand=True, padx=20, pady=5)
+        uyari = ctk.CTkLabel(pencere, text="", font=(FONT_ANA, 12), text_color=RENK_KIRMIZI)
+        uyari.pack(pady=(0, 10))
+
+        def listeyi_ciz():
+            for w in liste_frame.winfo_children():
+                w.destroy()
+            if not self.bekleyen_satislar:
+                pencere.destroy()
+                return
+            for anahtar, kayit in self.bekleyen_satislar.items():
+                satir = ctk.CTkFrame(liste_frame, fg_color="#333", corner_radius=8)
+                satir.pack(fill="x", pady=3, padx=2)
+                urun_adedi = sum(adet for _, _, _, _, adet in kayit["sepet"])
+                bilgi = (f"{kayit['etiket']}  [{kayit['zaman']}]\n"
+                         f"{urun_adedi} ürün — {self.format_tl(kayit['toplam_fiyat'])}")
+                ctk.CTkLabel(satir, text=bilgi, font=(FONT_ANA, 13, "bold"),
+                             justify="left", anchor="w").pack(side="left", padx=10, pady=8)
+                ctk.CTkButton(satir, text="🗑️", width=35, height=28,
+                              fg_color=RENK_KIRMIZI, hover_color="#c0392b",
+                              command=lambda a=anahtar: beklet_iptal(a)).pack(
+                                  side="right", padx=5)
+                ctk.CTkButton(satir, text="▶️ Devam Et", width=95, height=28,
+                              fg_color=RENK_YESIL, hover_color="#27ae60",
+                              font=(FONT_ANA, 12, "bold"),
+                              command=lambda a=anahtar: devam_et(a)).pack(
+                                  side="right", padx=5)
+
+        def devam_et(anahtar):
+            if self.sepet:
+                uyari.configure(
+                    text="Mevcut sepetiniz var — önce onu bekletin ya da tamamlayın!")
+                return
+            kayit = self.bekleyen_satislar.pop(anahtar)
+            # clear+extend: self.sepet liste nesnesi korunur, diğer referanslar bozulmaz
+            self.sepet.clear()
+            self.sepet.extend(kayit["sepet"])
+            self.sepet_gorunum.clear()
+            self.sepet_gorunum.extend(kayit["gorunum"])
+            self.toplam_fiyat   = kayit["toplam_fiyat"]
+            self.toplam_maliyet = kayit["toplam_maliyet"]
+            self._sepet_gorunumu_yenile()
+            self.toplam_etiketi.configure(text=self.format_tl(self.toplam_fiyat),
+                                          text_color=RENK_YESIL)
+            self._beklet_butonlari_guncelle()
+            pencere.destroy()
+            self.satis_barkod.focus()
+
+        def beklet_iptal(anahtar):
+            kayit = self.bekleyen_satislar[anahtar]
+            onay = ctk.CTkToplevel(pencere)
+            onay.title("Bekleyeni Sil")
+            onay.geometry("380x160")
+            onay.attributes("-topmost", True)
+            onay.grab_set()
+            ctk.CTkLabel(onay,
+                         text=f"⚠️ '{kayit['etiket']}' bekleyen satışı silinecek.\n"
+                              f"Bu işlem geri alınamaz, emin misiniz?",
+                         font=(FONT_ANA, 14, "bold"), justify="center").pack(pady=(25, 10))
+            btn_f = ctk.CTkFrame(onay, fg_color="transparent")
+            btn_f.pack(pady=5, fill="x", padx=30)
+
+            def sil():
+                del self.bekleyen_satislar[anahtar]
+                self._beklet_butonlari_guncelle()
+                onay.destroy()
+                pencere.grab_set()
+                listeyi_ciz()
+
+            ctk.CTkButton(btn_f, text="Evet, Sil", fg_color=RENK_KIRMIZI,
+                          hover_color="#c0392b",
+                          command=sil).pack(side="left", expand=True, padx=5)
+            ctk.CTkButton(btn_f, text="Vazgeç", fg_color=RENK_PANEL, hover_color="#444",
+                          command=lambda: (onay.destroy(), pencere.grab_set())).pack(
+                              side="right", expand=True, padx=5)
+
+        listeyi_ciz()
 
     # =========================================================
     # 2. ÜRÜN VE STOK YÖNETİMİ
@@ -1428,10 +1660,18 @@ class BufeSistemi(ctk.CTk):
     def veresiye_ekrani_kur(self):
         self.sekme_veresiye.grid_columnconfigure(0, weight=1)
         self.sekme_veresiye.grid_columnconfigure(1, weight=1)
-        self.sekme_veresiye.grid_rowconfigure(0, weight=1)
+        self.sekme_veresiye.grid_rowconfigure(1, weight=1)
+
+        # Arama: hem Alacaklar hem Borçlar listesini aynı anda filtreler
+        self.veresiye_arama = ctk.CTkEntry(self.sekme_veresiye,
+                                           placeholder_text="🔍 Müşteri/Tedarikçi Ara...",
+                                           font=(FONT_ANA, 14), height=35)
+        self.veresiye_arama.grid(row=0, column=0, columnspan=2, padx=10,
+                                 pady=(0, 5), sticky="ew")
+        self.veresiye_arama.bind("<KeyRelease>", lambda e: self.veresiye_listele())
 
         musteri_frame = ctk.CTkFrame(self.sekme_veresiye, fg_color=RENK_PANEL, corner_radius=15)
-        musteri_frame.grid(row=0, column=0, padx=10, sticky="nsew")
+        musteri_frame.grid(row=1, column=0, padx=10, sticky="nsew")
         ctk.CTkLabel(musteri_frame, text="📙 Müşteri Borçları (Alacaklarım)",
                      font=(FONT_ANA, 18, "bold"), text_color=RENK_YESIL).pack(pady=10)
         self.alacak_liste = ctk.CTkScrollableFrame(musteri_frame, fg_color="transparent")
@@ -1442,7 +1682,7 @@ class BufeSistemi(ctk.CTk):
         self.toplam_alacak_etiket.pack(pady=10)
 
         toptanci_frame = ctk.CTkFrame(self.sekme_veresiye, fg_color=RENK_PANEL, corner_radius=15)
-        toptanci_frame.grid(row=0, column=1, padx=10, sticky="nsew")
+        toptanci_frame.grid(row=1, column=1, padx=10, sticky="nsew")
         ctk.CTkLabel(toptanci_frame, text="📕 Toptancı / Gider (Borçlarım)",
                      font=(FONT_ANA, 18, "bold"), text_color=RENK_KIRMIZI).pack(pady=10)
         self.borc_liste = ctk.CTkScrollableFrame(toptanci_frame, fg_color="transparent")
@@ -1453,7 +1693,7 @@ class BufeSistemi(ctk.CTk):
         self.toplam_borc_etiket.pack(pady=10)
 
         islem_frame = ctk.CTkFrame(self.sekme_veresiye, fg_color="#222", corner_radius=15)
-        islem_frame.grid(row=1, column=0, columnspan=2, pady=10, padx=10, sticky="ew")
+        islem_frame.grid(row=2, column=0, columnspan=2, pady=10, padx=10, sticky="ew")
 
         self.v_isim = ctk.CTkEntry(islem_frame, placeholder_text="Kişi / Firma Adı",
                                     width=200, font=(FONT_ANA, 14))
@@ -1488,8 +1728,23 @@ class BufeSistemi(ctk.CTk):
             "SELECT id, isim, tip, bakiye, tarih, detay FROM Veresiye WHERE bakiye > 0")
         tum_satirlar = self.c.fetchall()
 
+        # Arama filtresi: iki listeyi de isim üzerinden aynı anda daraltır
+        # (Türkçe İ/I uyumu için _isim_normalize — Borca Yaz aramasıyla aynı mantık)
+        aranan = self._isim_normalize(self.veresiye_arama.get().strip())
+        if aranan:
+            tum_satirlar = [s for s in tum_satirlar
+                            if aranan in self._isim_normalize(s[1])]
+
         alacaklar = [s for s in tum_satirlar if s[2] == "alacak"]
         borclar   = [s for s in tum_satirlar if s[2] == "borc"]
+
+        # Filtre aktifken eşleşme yoksa bilgi mesajı göster
+        if aranan:
+            for hedef, kayitlar in ((self.alacak_liste, alacaklar),
+                                    (self.borc_liste, borclar)):
+                if not kayitlar:
+                    ctk.CTkLabel(hedef, text="Eşleşen kayıt bulunamadı.",
+                                 font=(FONT_ANA, 14), text_color="#aaa").pack(pady=20)
 
         def tarih_sort_key(satir):
             # NULL tarih → datetime.min → listenin en üstüne çıkar (en riskli)
