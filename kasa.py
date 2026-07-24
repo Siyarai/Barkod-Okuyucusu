@@ -2,6 +2,10 @@ import customtkinter as ctk
 import sqlite3
 import sys
 import os
+import shutil
+import time
+from tkinter import filedialog
+from PIL import Image
 from datetime import datetime
 
 # DB her zaman uygulamanın yanında: PyInstaller exe'sinde exe'nin klasörü,
@@ -11,6 +15,7 @@ if getattr(sys, 'frozen', False):
 else:
     UYGULAMA_DIZINI = os.path.dirname(os.path.abspath(__file__))
 DB_YOLU = os.path.join(UYGULAMA_DIZINI, "bufe_veritabani.db")
+RESIMLER_DIZINI = os.path.join(UYGULAMA_DIZINI, "resimler")
 
 try:
     import winsound
@@ -29,6 +34,9 @@ FONT_ANA    = "Segoe UI"
 # Alacakta bu gün sayısını geçmiş işlemler veresiye listesinde ⚠️ ile vurgulanır
 VERESIYE_UYARI_GUN_ESIGI = 14
 
+# Aynı hızlı tuşa bu süreden (saniye) daha kısa aralıkla ikinci kez basılırsa yok sayılır
+HIZLI_TIKLAMA_DEBOUNCE = 0.15
+
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
@@ -40,6 +48,7 @@ class BufeSistemi(ctk.CTk):
         self.title("Köşem Büfe - Kasa Sistemi")
         self.geometry("1200x800")
 
+        os.makedirs(RESIMLER_DIZINI, exist_ok=True)
         self.veritabani_olustur()
         self.sepet = []
         self.toplam_fiyat   = 0   # kuruş (integer)
@@ -47,6 +56,9 @@ class BufeSistemi(ctk.CTk):
         self.son_islem      = None  # sadece EN SON tamamlanan satış iptal edilebilir
         self.sepet_gorunum  = []    # self.sepet ile hizalı görünüm metinleri (saat, stok uyarısı)
         self.secili_urunler = set() # ürün listesinde checkbox ile seçilen barkodlar
+        self._urun_render_id = None  # _urun_satirlari_ciz'in bekleyen after() zinciri
+        self._hizli_son_tetik = {}  # barkod -> son tıklama zamanı (debounce için)
+        self._resim_cache = {}  # (tam_yol, genişlik, yükseklik) -> hazır CTkImage
         # Bekletilen satışlar (park): uygulama kapanınca kaybolur — bilinçli tercih,
         # Son Satışı İptal Et ile aynı mantık (DB'ye yazılmaz)
         self.bekleyen_satislar = {}
@@ -96,6 +108,10 @@ class BufeSistemi(ctk.CTk):
                 "ALTER TABLE Urunler ADD COLUMN grup_id INTEGER REFERENCES Gruplar(id)")
         except sqlite3.OperationalError:
             pass
+        try:
+            self.c.execute("ALTER TABLE Urunler ADD COLUMN resim_yolu TEXT")
+        except sqlite3.OperationalError:
+            pass
 
         self.c.execute('''CREATE TABLE IF NOT EXISTS Gunluk
                          (id INTEGER PRIMARY KEY, ciro INTEGER, kar INTEGER)''')
@@ -117,6 +133,8 @@ class BufeSistemi(ctk.CTk):
         # Sıralı tek seferlik migration'lar (PRAGMA user_version ile idempotent):
         # 0 → 1 : eski REAL (₺) → INTEGER (kuruş = ₺ × 100)
         # 1 → 2 : "Genel" grubu oluştur, grupsuz tüm ürünleri ona ata
+        # 2 → 3 : resim_yolu sütunu (ALTER TABLE zaten yukarıda try/except ile
+        #         çalıştı; burada sadece user_version ilerletiliyor)
         # Yeni boş DB de 0'dan başlayıp zincirin tamamından geçer (boş tablolarda no-op).
         self.c.execute("PRAGMA user_version")
         db_version = self.c.fetchone()[0]
@@ -147,6 +165,12 @@ class BufeSistemi(ctk.CTk):
                 "WHERE grup_id IS NULL")
             self.c.execute("PRAGMA user_version = 2")
             db_version = 2
+
+        if db_version == 2:
+            # resim_yolu sütunu yukarıda ALTER TABLE ile zaten eklendi; veri
+            # taşıma gerekmiyor, sadece versiyonu ilerletiyoruz
+            self.c.execute("PRAGMA user_version = 3")
+            db_version = 3
 
         self.conn.commit()
 
@@ -234,7 +258,9 @@ class BufeSistemi(ctk.CTk):
         self.toplam_etiketi.pack(pady=(0, 15))
 
         ctk.CTkLabel(sag_panel, text="⚡ Hızlı Ürünler", font=(FONT_ANA, 14, "bold")).pack(anchor="w")
-        self.hizli_tuslar_frame = ctk.CTkScrollableFrame(sag_panel, height=80,
+        # height=104: kart yüksekliği (94) + pady(5+5) sığsın diye büyütüldü
+        # (resimli kartlarda artık isim+fiyat iki satır olduğu için kart büyüdü)
+        self.hizli_tuslar_frame = ctk.CTkScrollableFrame(sag_panel, height=104,
                                                           orientation="horizontal", fg_color=RENK_PANEL)
         self.hizli_tuslar_frame.pack(fill="x", pady=(0, 10))
 
@@ -406,21 +432,116 @@ class BufeSistemi(ctk.CTk):
                       command=lambda: onayla(yeni_isim_entry.get())).pack(pady=10, padx=30, fill="x")
 
     def hizli_satis_tetikle(self, barkod):
+        # Debounce: aynı ürüne çok kısa aralıkla ikinci bir tıklama (örn. çift
+        # tıklama, fare/dokunmatik "sıçrama") tek işlem gibi ele alınır. Ürünü
+        # gerçekten art arda eklemek isteyen kullanıcı zaten normal tıklama
+        # hızında ekleyebilir, bu sadece kazara aynı-anlık çift tetiklemeyi engeller.
+        simdi = time.monotonic()
+        son_tetik = self._hizli_son_tetik.get(barkod, 0)
+        if simdi - son_tetik < HIZLI_TIKLAMA_DEBOUNCE:
+            return
+        self._hizli_son_tetik[barkod] = simdi
+
         self.satis_barkod.delete(0, "end")
         self.satis_barkod.insert(0, barkod)
         self.urunu_sepete_ekle(None)
 
+    # Hızlı tuş kartı boyutları: resimli kartlarda üst kısım (resim) alanın
+    # büyük çoğunluğunu kaplar, alt kısımda küçük punto'da isim+fiyat kalır
+    HIZLI_KART_GENISLIK  = 100
+    HIZLI_KART_YUKSEKLIK = 94
+    HIZLI_RESIM_YUKSEKLIK = 58
+    HIZLI_KART_KOSE       = 12
+    HIZLI_KART_KENAR      = 3   # iç widget'larla kart kenarı arası boşluk (bkz. not aşağıda)
+    HIZLI_HOVER_RENK      = "#2980b9"  # RENK_MAVI butonlarda kullanılan hover tonuyla tutarlı
+
     def hizli_tuslari_yukle(self):
+        # NOT: CTkButton'ın kendi image+compound mekanizması burada kullanılmıyor.
+        # customtkinter'ın CTkButton._create_grid() metodu yalnızca compound
+        # "right"/"left"/"top"/"bottom" değerlerini ele alıyor — "center" verildiğinde
+        # (resimsiz butonlarda kullanmıştık) text_label hiç grid'e yerleştirilmiyor,
+        # bu yüzden isim tamamen görünmez oluyordu. Ayrıca "resim üstü tam kaplasın,
+        # altta küçük isim" yerleşimi CTkButton'ın compound seçenekleriyle mümkün
+        # değil. Bu yüzden her kart elle bir CTkFrame + (varsa) resim CTkLabel'ı +
+        # isim CTkLabel'ı olarak kuruluyor; tıklama her iki alt widget'a da bind
+        # ediliyor ki kartın neresine tıklanırsa tıklansın ürün sepete eklensin.
+        #
+        # Bu fonksiyon her çağrıda TÜM kartları yok edip yeniden yaratıyor (aşağıdaki
+        # for widget...destroy() döngüsü), yani hiçbir widget üzerinde sonradan
+        # .configure(image=...) çağrılmıyor — Adım 2'de bulduğumuz "customtkinter
+        # eski resmi configure(image=None) ile temizlemiyor" kısıtı burada devreye
+        # girmiyor, çünkü zaten her resim her zaman TAZE bir widget'ın __init__'ine
+        # veriliyor.
         for widget in self.hizli_tuslar_frame.winfo_children():
             widget.destroy()
-        self.c.execute("SELECT barkod, isim, satis FROM Urunler WHERE hizli=1")
-        for barkod, isim, satis in self.c.fetchall():
-            btn = ctk.CTkButton(self.hizli_tuslar_frame,
-                                text=f"{isim}\n{self.format_tl(satis)}",
-                                width=100, height=60, font=(FONT_ANA, 14, "bold"),
-                                fg_color=RENK_MAVI, hover_color="#2980b9",
-                                command=lambda b=barkod: self.hizli_satis_tetikle(b))
-            btn.pack(side="left", padx=5, pady=5)
+
+        GENISLIK, YUKSEKLIK, RESIM_H, KOSE, KENAR, HOVER = (
+            self.HIZLI_KART_GENISLIK, self.HIZLI_KART_YUKSEKLIK,
+            self.HIZLI_RESIM_YUKSEKLIK, self.HIZLI_KART_KOSE,
+            self.HIZLI_KART_KENAR, self.HIZLI_HOVER_RENK)
+
+        self.c.execute("SELECT barkod, isim, satis, resim_yolu FROM Urunler WHERE hizli=1")
+        for barkod, isim, satis, resim_yolu in self.c.fetchall():
+            kart = ctk.CTkFrame(self.hizli_tuslar_frame, width=GENISLIK, height=YUKSEKLIK,
+                                corner_radius=KOSE, fg_color=RENK_MAVI, cursor="hand2")
+            kart.pack(side="left", padx=5, pady=5)
+            kart.pack_propagate(False)
+
+            renkli_widgetler = [kart]  # hover'da rengi birlikte değişecek widget'lar
+
+            # NOT (köşe yuvarlama neden görünmüyordu): CTkLabel'ın tema varsayılanı
+            # corner_radius=0 (kare köşe) ve alt widget'lar karta kenara kadar dayanıp
+            # AYNI renkle (RENK_MAVI) dolduruluyordu — bu kare köşeler, altındaki kart'ın
+            # corner_radius=12 ile çizdiği yuvarlak köşeleri tamamen örtüyordu. Çözüm:
+            # iç widget'larla kart kenarı arasına KENAR kadar boşluk bırakmak, böylece
+            # kartın kendi yuvarlak köşe boyası köşelerde görünür kalıyor.
+            resim_w, resim_h = GENISLIK - 2 * KENAR, RESIM_H - KENAR
+
+            ctk_img = None
+            if resim_yolu:
+                tam_yol = os.path.join(UYGULAMA_DIZINI, resim_yolu)
+                ctk_img = self._resim_kapla(tam_yol, resim_w, resim_h)
+
+            if ctk_img:
+                resim_lbl = ctk.CTkLabel(kart, image=ctk_img, text="",
+                                         width=resim_w, height=resim_h,
+                                         corner_radius=0, fg_color=RENK_MAVI,
+                                         cursor="hand2")
+                resim_lbl.image = ctk_img  # referans tutulmazsa GC siler, resim kaybolur
+                resim_lbl.pack(side="top", padx=KENAR, pady=(KENAR, 0))
+                renkli_widgetler.append(resim_lbl)
+
+                kisa_isim = isim if len(isim) <= 12 else isim[:11] + "…"
+                isim_lbl = ctk.CTkLabel(kart, text=f"{kisa_isim}\n{self.format_tl(satis)}",
+                                        font=(FONT_ANA, 10, "bold"),
+                                        text_color="white", fg_color=RENK_MAVI)
+                isim_lbl.pack(side="top", fill="both", expand=True,
+                              padx=KENAR, pady=(0, KENAR))
+                renkli_widgetler.append(isim_lbl)
+            else:
+                # Resimsiz: eski davranış — isim + fiyat, ortalanmış, kartın tamamını kaplar
+                isim_lbl = ctk.CTkLabel(kart, text=f"{isim}\n{self.format_tl(satis)}",
+                                        font=(FONT_ANA, 13, "bold"), text_color="white",
+                                        fg_color=RENK_MAVI)
+                isim_lbl.pack(fill="both", expand=True, padx=KENAR, pady=KENAR)
+                renkli_widgetler.append(isim_lbl)
+
+            # fg_color'ı "transparent" değil EXPLICIT (RENK_MAVI) tutuyoruz ki hover'da
+            # her widget'ı tek tek boyayabilelim — "transparent" ile üst widget'ın rengini
+            # otomatik yansıtmaya güvenmek (customtkinter'ın bu oturumda bulduğumuz başka
+            # kısıtları göz önüne alınca) riskli olurdu
+            def _hover_gir(e, widgets=renkli_widgetler):
+                for w in widgets:
+                    w.configure(fg_color=HOVER)
+
+            def _hover_cik(e, widgets=renkli_widgetler):
+                for w in widgets:
+                    w.configure(fg_color=RENK_MAVI)
+
+            for w in renkli_widgetler:
+                w.bind("<Button-1>", lambda e, b=barkod: self.hizli_satis_tetikle(b))
+                w.bind("<Enter>", _hover_gir)
+                w.bind("<Leave>", _hover_cik)
 
     def urunu_sepete_ekle(self, event):
         barkod = self.satis_barkod.get().strip()
@@ -459,7 +580,13 @@ class BufeSistemi(ctk.CTk):
             satir = f"[{zaman}] {isim[:15]:<15} x{adet:<2} {self.format_tl(toplam_satis):>9}{stok_uyarisi}"
 
             self.sepet_gorunum.append(satir)
-            self._sepet_gorunumu_yenile()
+            if len(self.sepet_gorunum) == 1:
+                # İlk kalem: önceki "--- İŞLEM İPTAL EDİLDİ ---" mesajı gibi bir
+                # kalıntı olabileceğinden tam yeniden çizim ile temizlenmesi garanti edilir
+                self._sepet_gorunumu_yenile()
+            else:
+                # Sonraki kalemler: mevcut satırlara dokunmadan sadece yenisini ekle
+                self._sepet_satir_ekle(len(self.sepet_gorunum) - 1, satir)
             self._beklet_butonlari_guncelle()
             self.toplam_etiketi.configure(text=self.format_tl(self.toplam_fiyat), text_color=RENK_YESIL)
             self.satis_adet.delete(0, "end")
@@ -471,7 +598,9 @@ class BufeSistemi(ctk.CTk):
                 text=self.format_tl(self.toplam_fiyat), text_color=RENK_YESIL))
 
     def _sepet_gorunumu_yenile(self, mesaj=None):
-        """Sepet listesini self.sepet/self.sepet_gorunum'dan yeniden çizer."""
+        """Sepet listesini self.sepet/self.sepet_gorunum'dan BAŞTAN çizer.
+        Silme/tam temizleme/geri yükleme gibi tüm satırların (ve "✕" butonlarının
+        index'lerinin) yeniden hesaplanması gereken durumlarda kullanılır."""
         for w in self.sepet_liste_frame.winfo_children():
             w.destroy()
 
@@ -481,18 +610,36 @@ class BufeSistemi(ctk.CTk):
             return
 
         for i, metin in enumerate(self.sepet_gorunum):
-            satir = ctk.CTkFrame(self.sepet_liste_frame, fg_color="transparent")
-            satir.pack(fill="x", pady=1)
-            ctk.CTkLabel(satir, text=metin, font=("Consolas", 15),
-                         text_color="white", anchor="w").pack(side="left", padx=(5, 0))
-            ctk.CTkButton(satir, text="✕", width=28, height=24,
-                          font=(FONT_ANA, 12, "bold"),
-                          fg_color="transparent", hover_color=RENK_KIRMIZI,
-                          text_color="#888",
-                          command=lambda idx=i: self.sepetten_kalem_sil(idx)).pack(
-                              side="right", padx=(0, 5))
+            self._sepet_satir_ciz(i, metin)
 
         # Son eklenen satır görünür kalsın
+        self.after(50, lambda: self._sepet_sona_kaydir())
+
+    def _sepet_satir_ciz(self, index, metin):
+        """Tek bir sepet satırını (metin + ✕ butonu) mevcut satırlara DOKUNMADAN çizer."""
+        satir = ctk.CTkFrame(self.sepet_liste_frame, fg_color="transparent")
+        satir.pack(fill="x", pady=1)
+        ctk.CTkLabel(satir, text=metin, font=("Consolas", 15),
+                     text_color="white", anchor="w").pack(side="left", padx=(5, 0))
+        ctk.CTkButton(satir, text="✕", width=28, height=24,
+                      font=(FONT_ANA, 12, "bold"),
+                      fg_color="transparent", hover_color=RENK_KIRMIZI,
+                      text_color="#888",
+                      command=lambda idx=index: self.sepetten_kalem_sil(idx)).pack(
+                          side="right", padx=(0, 5))
+
+    def _sepet_satir_ekle(self, index, metin):
+        """Sepete YENİ eklenen tek kalemi, MEVCUT satırları yok edip yeniden
+        kurmadan ekler. _sepet_gorunumu_yenile'nin O(n) tam-yeniden-çizimine göre
+        çok daha ucuz: hızlı tuşlara art arda basıldığında her tıklamada TÜM
+        sepetin (o ana kadarki N satırın) yok edilip yeniden kurulması yerine
+        yalnızca 1 yeni satır eklenir — N tıklama toplamda O(n²) yerine O(n) iş
+        yapar. Bu, önceki turda araştırdığımız "sepet paneli hızlı tıklamada
+        bozuluyor" şikayetinin muhtemel gerçek kaynağı: veri/widget sayımı hep
+        tutarlıydı (izole testte doğrulandı), ama sepet büyüdükçe her tıklamada
+        TÜM satırların art arda yok edilip yeniden çizilmesi görsel titremeye
+        (flicker) yol açıyordu — kullanıcı bunu "bozulma" olarak algılamış olabilir."""
+        self._sepet_satir_ciz(index, metin)
         self.after(50, lambda: self._sepet_sona_kaydir())
 
     def _sepet_sona_kaydir(self):
@@ -919,6 +1066,38 @@ class BufeSistemi(ctk.CTk):
         self.ekle_grup_menu.set("Genel")
         self._grup_filtre_yenile()  # form menüsü artık var — güncel gruplarla doldur
 
+        # Resim seçimi: self.ekle_resim_yolu formun "bekleyen" resim durumu —
+        # KAYDET'e basılana kadar DB'ye yazılmaz (diğer form alanlarıyla tutarlı)
+        self.ekle_resim_yolu = None
+        resim_frame = ctk.CTkFrame(sag_frame, fg_color="transparent")
+        resim_frame.pack(pady=5, fill="x", padx=20)
+
+        # Sabit boyutlu slot: önizleme widget'ı her güncellemede burada yeniden
+        # yaratılır (bkz. _urun_resim_onizleme_guncelle) — CTkLabel.configure(image=None)
+        # customtkinter'da eski resmi görsel olarak temizlemiyor (kütüphane kısıtı),
+        # bu yüzden "resim yok" durumuna güvenle dönmenin tek yolu widget'ı yenilemek
+        self.ekle_resim_slot = ctk.CTkFrame(resim_frame, width=60, height=60,
+                                            fg_color="transparent")
+        self.ekle_resim_slot.pack(side="left", padx=(0, 12))
+        self.ekle_resim_slot.pack_propagate(False)
+        self.ekle_resim_onizleme = None
+
+        resim_btn_frame = ctk.CTkFrame(resim_frame, fg_color="transparent")
+        resim_btn_frame.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(resim_btn_frame, text="🖼️ Resim Seç", height=30,
+                      font=(FONT_ANA, 12, "bold"), fg_color=RENK_MAVI,
+                      hover_color="#2980b9", command=self.urun_resim_sec).pack(fill="x")
+        ctk.CTkLabel(resim_btn_frame,
+                     text="ℹ️ Resim yalnızca ⚡ Hızlı Tuş işaretli ürünlerde gösterilir.",
+                     font=(FONT_ANA, 10), text_color="#888",
+                     justify="left", anchor="w").pack(fill="x", pady=(3, 0))
+        self.resim_kaldir_buton = ctk.CTkButton(
+            resim_btn_frame, text="🗑️ Resmi Kaldır", height=26,
+            font=(FONT_ANA, 11), fg_color="transparent", text_color=RENK_KIRMIZI,
+            hover_color="#333", state="disabled", command=self.urun_resim_kaldir)
+        self.resim_kaldir_buton.pack(fill="x", pady=(4, 0))
+        self._urun_resim_onizleme_guncelle()  # ilk çizim: "Resim yok" durumu
+
         self.check_hizli = ctk.CTkCheckBox(sag_frame,
                                             text="Satış Ekranına Hızlı Tuş Olarak Ekle",
                                             font=(FONT_ANA, 14, "bold"), fg_color=RENK_YESIL)
@@ -931,6 +1110,123 @@ class BufeSistemi(ctk.CTk):
 
         self.durum_etiketi = ctk.CTkLabel(sag_frame, text="", font=(FONT_ANA, 12))
         self.durum_etiketi.pack()
+
+    def _resim_kapla(self, tam_yol, hedef_w, hedef_h):
+        """Resmi hedef alanı TAM KAPLAYACAK şekilde ölçekleyip ortadan kırpar
+        (CSS object-fit: cover mantığı — thumbnail() gibi içine sığdırmaz,
+        boşluk bırakmadan doldurur). Dosya yoksa/bozuksa sessizce None döner.
+
+        Sonuç self._resim_cache'te tutulur: hızlı tuşlar her yenilendiğinde
+        (hizli_tuslari_yukle) aynı resmi diskten tekrar okuyup yeniden
+        ölçeklemek yerine hazır CTkImage'ı doğrudan döndürür. Ürün sayısı
+        arttıkça bu, her yenilemede tekrarlanan O(n) disk+CPU işini önler.
+        Cache, resim değiştiğinde _resim_cache_temizle ile geçersiz kılınır."""
+        cache_anahtari = (tam_yol, hedef_w, hedef_h)
+        if cache_anahtari in self._resim_cache:
+            return self._resim_cache[cache_anahtari]
+        try:
+            img = Image.open(tam_yol)
+            kaynak_w, kaynak_h = img.size
+            olcek = max(hedef_w / kaynak_w, hedef_h / kaynak_h)
+            yeni_boyut = (max(1, round(kaynak_w * olcek)), max(1, round(kaynak_h * olcek)))
+            img = img.resize(yeni_boyut, Image.LANCZOS)
+            sol = (yeni_boyut[0] - hedef_w) // 2
+            ust  = (yeni_boyut[1] - hedef_h) // 2
+            img = img.crop((sol, ust, sol + hedef_w, ust + hedef_h))
+            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(hedef_w, hedef_h))
+            self._resim_cache[cache_anahtari] = ctk_img
+            return ctk_img
+        except Exception:
+            return None
+
+    def _resim_cache_temizle(self, resim_yolu):
+        """Belirtilen (DB'deki relatif) resim yoluna ait tüm cache girdilerini siler.
+        Resim içeriği değiştiğinde (yeni seçim ya da kayıt) çağrılır ki eski
+        önbelleklenmiş görüntü hızlı tuşlarda görünmeye devam etmesin."""
+        if not resim_yolu:
+            return
+        tam_yol = os.path.join(UYGULAMA_DIZINI, resim_yolu)
+        for anahtar in [k for k in self._resim_cache if k[0] == tam_yol]:
+            del self._resim_cache[anahtar]
+
+    def _urun_resim_onizleme_guncelle(self):
+        """self.ekle_resim_yolu'na göre form önizlemesini çizer.
+        Dosya eksik/bozuksa sessizce 'Resim yok' durumuna düşer, çökmez.
+
+        Widget her çağrıda YOK EDİLİP YENİDEN YARATILIR: CTkLabel.configure(image=None)
+        customtkinter'da alttaki tkinter.Label'ın image'ını görsel olarak temizlemiyor
+        (kütüphanenin _update_image metodu image=None durumunu hiç ele almıyor), bu
+        yüzden configure ile "resimsiz"e dönmeye güvenilemez — eski resim ekranda kalır
+        ve üstüne binen metinle çakışır. Widget'ı yenilemek bunu kökten önler."""
+        if self.ekle_resim_onizleme is not None:
+            self.ekle_resim_onizleme.destroy()
+            self.ekle_resim_onizleme = None
+
+        yol = self.ekle_resim_yolu
+        if yol:
+            tam_yol = os.path.join(UYGULAMA_DIZINI, yol)
+            try:
+                img = Image.open(tam_yol)
+                img.thumbnail((60, 60))
+                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+                self.ekle_resim_onizleme = ctk.CTkLabel(self.ekle_resim_slot,
+                                                        image=ctk_img, text="")
+                self.ekle_resim_onizleme.image = ctk_img  # referans tutulmazsa GC siler
+                self.ekle_resim_onizleme.pack(expand=True, fill="both")
+                self.resim_kaldir_buton.configure(state="normal")
+                return
+            except Exception:
+                pass  # dosya bulunamadı/bozuk — metin göstergesine düş
+
+        self.ekle_resim_onizleme = ctk.CTkLabel(self.ekle_resim_slot, text="Resim\nyok",
+                                                fg_color="#222", corner_radius=8,
+                                                font=(FONT_ANA, 11), text_color="#888")
+        self.ekle_resim_onizleme.pack(expand=True, fill="both")
+        self.resim_kaldir_buton.configure(state="disabled")
+
+    def urun_resim_sec(self):
+        barkod = self.ekle_barkod.get().strip()
+        if not barkod:
+            self.durum_etiketi.configure(text="Önce barkod girin, resim ondan sonra seçilir!",
+                                         text_color=RENK_KIRMIZI)
+            return
+
+        secilen = filedialog.askopenfilename(
+            title="Ürün Resmi Seç",
+            filetypes=[("Resim Dosyaları", "*.png *.jpg *.jpeg *.webp")])
+        if not secilen:
+            return
+
+        uzanti = os.path.splitext(secilen)[1].lower()
+        if uzanti not in (".png", ".jpg", ".jpeg", ".webp"):
+            self.durum_etiketi.configure(text="Desteklenmeyen resim formatı!",
+                                         text_color=RENK_KIRMIZI)
+            return
+
+        hedef_ad  = f"{barkod}{uzanti}"
+        hedef_tam = os.path.join(RESIMLER_DIZINI, hedef_ad)
+        try:
+            shutil.copy(secilen, hedef_tam)  # kullanıcının orijinal dosyasına dokunulmaz
+        except OSError as e:
+            self.durum_etiketi.configure(text=f"Resim kopyalanamadı: {e}",
+                                         text_color=RENK_KIRMIZI)
+            return
+
+        # DB'ye UYGULAMA_DIZINI'ne göre RELATİF yol yazılır (taşınabilirlik için)
+        self.ekle_resim_yolu = os.path.join("resimler", hedef_ad)
+        # Aynı barkod+uzantıyla önceden bir resim vardıysa dosya az önce
+        # shutil.copy ile üzerine yazıldı — cache'teki eski görüntü artık geçersiz
+        self._resim_cache_temizle(self.ekle_resim_yolu)
+        self._urun_resim_onizleme_guncelle()
+        self.durum_etiketi.configure(text="Resim seçildi (KAYDET'e basmayı unutmayın).",
+                                     text_color=RENK_SARI)
+
+    def urun_resim_kaldir(self):
+        # Yalnızca formun bekleyen durumunu temizler; DB'ye yazım KAYDET ile olur
+        self.ekle_resim_yolu = None
+        self._urun_resim_onizleme_guncelle()
+        self.durum_etiketi.configure(text="Resim kaldırıldı (KAYDET'e basmayı unutmayın).",
+                                     text_color=RENK_SARI)
 
     def genel_depo_maliyeti_guncelle(self):
         self.c.execute("SELECT SUM(stok * alis) FROM Urunler WHERE stok > 0")
@@ -946,6 +1242,15 @@ class BufeSistemi(ctk.CTk):
         self._arama_timer = self.after(350, self.urunleri_listele)
 
     def urunleri_listele(self, event=None):
+        # Önceki çağrının bitmemiş chunk-render zincirini iptal et — aksi halde
+        # art arda hızlı çağrılarda (örn. grup filtresi hızlı değiştirilirse)
+        # birden fazla self.after(10, ...) zinciri aynı anda çalışıp aynı frame'e
+        # kat kat satır ekler (doğrulanmış bug: 5 art arda çağrı 60 yerine 260
+        # widget üretiyordu)
+        if self._urun_render_id is not None:
+            self.after_cancel(self._urun_render_id)
+            self._urun_render_id = None
+
         for widget in self.urun_listesi_frame.winfo_children():
             widget.destroy()
 
@@ -1066,7 +1371,10 @@ class BufeSistemi(ctk.CTk):
                               self.stok_guncelle_popup(b, n, a, ls, lm)).pack(side="right", padx=5)
 
         if bitis < len(satirlar):
-            self.after(10, lambda: self._urun_satirlari_ciz(satirlar, bitis, chunk))
+            self._urun_render_id = self.after(
+                10, lambda: self._urun_satirlari_ciz(satirlar, bitis, chunk))
+        else:
+            self._urun_render_id = None  # zincir tamamlandı
 
     def stok_guncelle_popup(self, barkod, isim, alis_fiyati, lbl_stok, lbl_maliyet):
         # alis_fiyati kuruş cinsinden integer
@@ -1144,18 +1452,20 @@ class BufeSistemi(ctk.CTk):
             entry.delete(0, "end")
 
         self.c.execute(
-            "SELECT u.isim, u.alis, u.satis, u.stok, u.hizli, g.isim "
+            "SELECT u.isim, u.alis, u.satis, u.stok, u.hizli, g.isim, u.resim_yolu "
             "FROM Urunler u LEFT JOIN Gruplar g ON g.id = u.grup_id "
             "WHERE u.barkod=?", (barkod,))
         urun = self.c.fetchone()
         if urun:
-            isim, alis, satis, stok, hizli, grup_isim = urun  # alis, satis kuruş
+            isim, alis, satis, stok, hizli, grup_isim, resim_yolu = urun  # alis, satis kuruş
             self.ses_cikar("ok")
             self.ekle_isim.insert(0, isim)
             self.ekle_alis.insert(0, f"{alis / 100:.2f}")   # kuruşu TL'ye çevirerek göster
             self.ekle_satis.insert(0, f"{satis / 100:.2f}") # kuruşu TL'ye çevirerek göster
             self.ekle_stok.insert(0, str(stok))
             self.ekle_grup_menu.set(grup_isim if grup_isim else "Genel")
+            self.ekle_resim_yolu = resim_yolu
+            self._urun_resim_onizleme_guncelle()
             if hizli == 1:
                 self.check_hizli.select()
             else:
@@ -1166,6 +1476,8 @@ class BufeSistemi(ctk.CTk):
             self.ses_cikar("hata")
             self.check_hizli.deselect()
             self.ekle_grup_menu.set("Genel")
+            self.ekle_resim_yolu = None
+            self._urun_resim_onizleme_guncelle()
             self.durum_etiketi.configure(text="Yeni Ürün!", text_color=RENK_MAVI)
             self.ekle_isim.focus()
 
@@ -1184,18 +1496,25 @@ class BufeSistemi(ctk.CTk):
             satis = self._para_parse(self.ekle_satis.get())  # TL → kuruş
             stok  = int(self.ekle_stok.get()) if self.ekle_stok.get().strip() else 0
 
-            # grup_id formdaki seçimden gelir; isim bulunamazsa Genel'e düşer
+            # grup_id formdaki seçimden gelir; isim bulunamazsa Genel'e düşer.
+            # resim_yolu: self.ekle_resim_yolu — dokunulmadıysa urun_bilgisi_getir'in
+            # DB'den yüklediği değer olarak kalır (örtük "korunma"), resim_sec/kaldir
+            # ile değiştirildiyse yeni durum yazılır
             secili_grup = self.ekle_grup_menu.get()
             self.c.execute(
                 "INSERT OR REPLACE INTO Urunler "
-                "(barkod, isim, alis, satis, satilan_adet, stok, hizli, grup_id) "
+                "(barkod, isim, alis, satis, satilan_adet, stok, hizli, grup_id, resim_yolu) "
                 "VALUES (?, ?, ?, ?, "
                 "COALESCE((SELECT satilan_adet FROM Urunler WHERE barkod=?), 0), ?, ?, "
                 "COALESCE((SELECT id FROM Gruplar WHERE isim=?), "
-                "         (SELECT id FROM Gruplar WHERE isim='Genel')))",
-                (barkod, isim, alis, satis, barkod, stok, hizli_mi, secili_grup))
+                "         (SELECT id FROM Gruplar WHERE isim='Genel')), ?)",
+                (barkod, isim, alis, satis, barkod, stok, hizli_mi, secili_grup,
+                 self.ekle_resim_yolu))
             self.conn.commit()
             self.durum_etiketi.configure(text="Kaydedildi!", text_color=RENK_YESIL)
+            # Bu barkoda ait resim değişmiş olabilir — hızlı tuşlar yenilenmeden
+            # önce cache'i temizle, aksi halde eski görüntü önbellekten gelmeye devam eder
+            self._resim_cache_temizle(self.ekle_resim_yolu)
             self.urunleri_listele()
             self.hizli_tuslari_yukle()
 
@@ -1204,6 +1523,8 @@ class BufeSistemi(ctk.CTk):
                 entry.delete(0, "end")
             self.check_hizli.deselect()
             self.ekle_grup_menu.set("Genel")
+            self.ekle_resim_yolu = None
+            self._urun_resim_onizleme_guncelle()
             self.ekle_barkod.focus()
         except ValueError:
             self.durum_etiketi.configure(
