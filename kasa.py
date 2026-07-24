@@ -116,10 +116,20 @@ class BufeSistemi(ctk.CTk):
         self.c.execute('''CREATE TABLE IF NOT EXISTS Gunluk
                          (id INTEGER PRIMARY KEY, ciro INTEGER, kar INTEGER)''')
         self.c.execute("INSERT OR IGNORE INTO Gunluk (id, ciro, kar) VALUES (1, 0, 0)")
+        try:
+            self.c.execute("ALTER TABLE Gunluk ADD COLUMN nakit_toplam INTEGER DEFAULT 0")
+            self.c.execute("ALTER TABLE Gunluk ADD COLUMN kart_toplam INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
         self.c.execute('''CREATE TABLE IF NOT EXISTS GunlukGecmis
                          (id INTEGER PRIMARY KEY AUTOINCREMENT, tarih TEXT,
                           ciro INTEGER, kar INTEGER)''')
+        try:
+            self.c.execute("ALTER TABLE GunlukGecmis ADD COLUMN nakit_toplam INTEGER DEFAULT 0")
+            self.c.execute("ALTER TABLE GunlukGecmis ADD COLUMN kart_toplam INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
         self.c.execute('''CREATE TABLE IF NOT EXISTS Veresiye
                          (id INTEGER PRIMARY KEY AUTOINCREMENT, isim TEXT, tip TEXT,
@@ -135,6 +145,10 @@ class BufeSistemi(ctk.CTk):
         # 1 → 2 : "Genel" grubu oluştur, grupsuz tüm ürünleri ona ata
         # 2 → 3 : resim_yolu sütunu (ALTER TABLE zaten yukarıda try/except ile
         #         çalıştı; burada sadece user_version ilerletiliyor)
+        # 3 → 4 : nakit_toplam/kart_toplam sütunları (ödeme yöntemi ayrımı).
+        #         Geriye dönük varsayım: bu özellik yokken yapılan TÜM satışlar
+        #         fiilen nakitti, bu yüzden mevcut ciro → nakit_toplam'a aynen
+        #         kopyalanır, kart_toplam=0 kalır.
         # Yeni boş DB de 0'dan başlayıp zincirin tamamından geçer (boş tablolarda no-op).
         self.c.execute("PRAGMA user_version")
         db_version = self.c.fetchone()[0]
@@ -171,6 +185,14 @@ class BufeSistemi(ctk.CTk):
             # taşıma gerekmiyor, sadece versiyonu ilerletiyoruz
             self.c.execute("PRAGMA user_version = 3")
             db_version = 3
+
+        if db_version == 3:
+            # Mevcut ciro'yu nakit_toplam'a aynen kopyala — bu özellik öncesi
+            # tüm satışlar fiilen nakitti (en doğru geriye dönük varsayım)
+            self.c.execute("UPDATE Gunluk SET nakit_toplam = ciro WHERE id=1")
+            self.c.execute("UPDATE GunlukGecmis SET nakit_toplam = ciro")
+            self.c.execute("PRAGMA user_version = 4")
+            db_version = 4
 
         self.conn.commit()
 
@@ -284,7 +306,7 @@ class BufeSistemi(ctk.CTk):
         self.bitir_buton = ctk.CTkButton(sag_panel, text="✅ SATIŞI ONAYLA",
                                          font=(FONT_ANA, 20, "bold"), height=55,
                                          fg_color=RENK_YESIL, hover_color="#27ae60",
-                                         corner_radius=15, command=self.islemi_bitir)
+                                         corner_radius=15, command=self.odeme_yontemi_sec_popup)
         self.bitir_buton.pack(fill="x", pady=5)
 
         self.veresiye_buton = ctk.CTkButton(sag_panel, text="📓 SEPETİ BORCA YAZ",
@@ -386,6 +408,11 @@ class BufeSistemi(ctk.CTk):
                 "veresiye_musteri": isim,
                 "veresiye_detay_eklendi": yeni_detay_kismi,
                 "veresiye_eski_tarih": eski_tarih,  # None → yeni kayıt → iptalde DELETE
+                # Veresiye ne nakit ne karttır — Gunluk.nakit_toplam/kart_toplam'a
+                # hiç katkısı olmaz, 0 olması bu iki kolonu iptalde de güvenle
+                # (dallanmaya gerek kalmadan) sıfır katkıyla güncellememizi sağlar
+                "nakit_tutar": 0,
+                "kart_tutar": 0,
             }
 
             self._satisi_isle(self.sepet, self.toplam_fiyat, self.toplam_maliyet)
@@ -673,7 +700,128 @@ class BufeSistemi(ctk.CTk):
                 "UPDATE Urunler SET satilan_adet = satilan_adet + ?, stok = stok - ? WHERE barkod=?",
                 (adet, adet, barkod))
 
-    def islemi_bitir(self):
+    def odeme_yontemi_sec_popup(self):
+        if not self.sepet:
+            return
+
+        PENCERE_GENISLIK = 380
+        pencere_yukseklik_normal = 340
+        pencere_yukseklik_parcali = 440  # Parçalı: 2 giriş kutusu + Onayla için +100px
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Ödeme Yöntemi")
+        pencere.geometry(f"{PENCERE_GENISLIK}x{pencere_yukseklik_normal}")
+        pencere.attributes("-topmost", True)
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="💳 Ödeme Yöntemi",
+                     font=(FONT_ANA, 18, "bold"), text_color=RENK_MAVI).pack(pady=(20, 5))
+        ctk.CTkLabel(pencere, text=f"Toplam: {self.format_tl(self.toplam_fiyat)}",
+                     font=(FONT_ANA, 16, "bold"), text_color=RENK_SARI).pack(pady=(0, 15))
+
+        secim_frame = ctk.CTkFrame(pencere, fg_color="transparent")
+        secim_frame.pack(fill="x", padx=30)
+
+        def tamamla(nakit_kurus, kart_kurus):
+            pencere.destroy()
+            self.islemi_bitir(nakit_kurus, kart_kurus)
+
+        ctk.CTkButton(secim_frame, text="💵 Nakit", height=45, font=(FONT_ANA, 15, "bold"),
+                      fg_color=RENK_YESIL, hover_color="#27ae60",
+                      command=lambda: tamamla(self.toplam_fiyat, 0)).pack(fill="x", pady=5)
+        ctk.CTkButton(secim_frame, text="💳 Kart", height=45, font=(FONT_ANA, 15, "bold"),
+                      fg_color=RENK_MAVI, hover_color="#2980b9",
+                      command=lambda: tamamla(0, self.toplam_fiyat)).pack(fill="x", pady=5)
+
+        parcali_container = ctk.CTkFrame(pencere, fg_color="transparent")
+
+        def parcali_ac():
+            parcali_buton.configure(state="disabled")  # tekrar tıklanıp ikinci kez açılmasın
+            parcali_container.pack(fill="x", padx=30, pady=(10, 0))
+
+            # İki giriş kutusu + Onayla butonu için pencereyi dikey büyüt —
+            # genişlik aynı kalır, kullanıcı elle uzatmak zorunda kalmasın
+            pencere.geometry(f"{PENCERE_GENISLIK}x{pencere_yukseklik_parcali}")
+
+            # guncelleniyor: programatik doldurma sırasında kendi KeyRelease'ini
+            # yok saymak için (döngüye girmemek adına — .insert()/.delete() normalde
+            # KeyRelease tetiklemez ama bu oturumda customtkinter'da birkaç kez
+            # beklenmedik davranışla karşılaştık, ekstra güvence olarak tutuyoruz)
+            # son_degisen: Onayla'ya basıldığında hangi kutunun kullanıcı girdisi
+            # OTORİTER kabul edileceğini belirler — diğeri her zaman ondan türetilir,
+            # böylece iki taraf toplamdan asla kuruşu kuruşuna sapmaz
+            durum = {"guncelleniyor": False, "son_degisen": "nakit"}
+
+            ctk.CTkLabel(parcali_container, text="Nakit", font=(FONT_ANA, 12)).pack(anchor="w")
+            nakit_entry = ctk.CTkEntry(parcali_container, font=(FONT_ANA, 14), justify="center")
+            nakit_entry.pack(fill="x", pady=(0, 8))
+
+            ctk.CTkLabel(parcali_container, text="Kart", font=(FONT_ANA, 12)).pack(anchor="w")
+            kart_entry = ctk.CTkEntry(parcali_container, font=(FONT_ANA, 14), justify="center")
+            kart_entry.pack(fill="x", pady=(0, 8))
+
+            def deger_kurus(entry):
+                metin = entry.get().strip()
+                if not metin:
+                    return 0
+                try:
+                    return self._para_parse(metin)
+                except ValueError:
+                    return 0
+
+            def nakit_degisti(event=None):
+                if durum["guncelleniyor"]:
+                    return
+                durum["son_degisen"] = "nakit"
+                kalan = max(0, self.toplam_fiyat - deger_kurus(nakit_entry))
+                durum["guncelleniyor"] = True
+                kart_entry.delete(0, "end")
+                kart_entry.insert(0, f"{kalan / 100:.2f}")
+                durum["guncelleniyor"] = False
+
+            def kart_degisti(event=None):
+                if durum["guncelleniyor"]:
+                    return
+                durum["son_degisen"] = "kart"
+                kalan = max(0, self.toplam_fiyat - deger_kurus(kart_entry))
+                durum["guncelleniyor"] = True
+                nakit_entry.delete(0, "end")
+                nakit_entry.insert(0, f"{kalan / 100:.2f}")
+                durum["guncelleniyor"] = False
+
+            nakit_entry.bind("<KeyRelease>", nakit_degisti)
+            kart_entry.bind("<KeyRelease>", kart_degisti)
+
+            # Başlangıç önerisi: tamamı nakit — kullanıcı istediği kutuyu değiştirir
+            nakit_entry.insert(0, f"{self.toplam_fiyat / 100:.2f}")
+            kart_entry.insert(0, "0.00")
+            nakit_entry.focus()
+
+            def onayla_parcali():
+                # Son değiştirilen kutu OTORİTER kaynak: toplama göre 0..toplam
+                # arasına kelepçelenir, diğeri HER ZAMAN ondan türetilir. Böylece
+                # kullanıcı toplamdan büyük bir değer yazsa bile (ya da iki kutu
+                # tutarsız bir metin içerse) nakit+kart toplamı asla sapmaz —
+                # ayrı bir "toplamlar eşit mi" hata kontrolüne gerek kalmaz.
+                if durum["son_degisen"] == "kart":
+                    kart_kurus = min(deger_kurus(kart_entry), self.toplam_fiyat)
+                    nakit_kurus = self.toplam_fiyat - kart_kurus
+                else:
+                    nakit_kurus = min(deger_kurus(nakit_entry), self.toplam_fiyat)
+                    kart_kurus = self.toplam_fiyat - nakit_kurus
+                tamamla(nakit_kurus, kart_kurus)
+
+            ctk.CTkButton(parcali_container, text="Onayla", fg_color=RENK_YESIL,
+                          hover_color="#27ae60", font=(FONT_ANA, 14, "bold"),
+                          command=onayla_parcali).pack(fill="x", pady=(10, 0))
+
+        parcali_buton = ctk.CTkButton(secim_frame, text="🔀 Parçalı", height=45,
+                                      font=(FONT_ANA, 15, "bold"), fg_color=RENK_SARI,
+                                      text_color="black", hover_color="#f39c12",
+                                      command=parcali_ac)
+        parcali_buton.pack(fill="x", pady=5)
+
+    def islemi_bitir(self, nakit_tutar, kart_tutar):
         if not self.sepet:
             return
         # En son satış bilgisini hafızaya al; yeni satış yapılınca otomatik üzerine yazılır
@@ -686,8 +834,14 @@ class BufeSistemi(ctk.CTk):
             "veresiye_id": None,
             "veresiye_musteri": None,
             "veresiye_detay_eklendi": None,
+            "nakit_tutar": nakit_tutar,
+            "kart_tutar": kart_tutar,
         }
         self._satisi_isle(self.sepet, self.toplam_fiyat, self.toplam_maliyet)
+        self.c.execute(
+            "UPDATE Gunluk SET nakit_toplam = nakit_toplam + ?, kart_toplam = kart_toplam + ? "
+            "WHERE id=1",
+            (nakit_tutar, kart_tutar))
         self.conn.commit()
         self.sepeti_temizle(tamamen=True)
         self.ses_cikar("ok")
@@ -746,11 +900,13 @@ class BufeSistemi(ctk.CTk):
                 "WHERE barkod=?",
                 (adet, adet, barkod))
 
-        # 2. Günlük ciro ve karı geri çıkar
+        # 2. Günlük ciro/kar ve nakit/kart ayrımını geri çıkar (veresiyede
+        # nakit_tutar/kart_tutar zaten 0, bu UPDATE her iki tipte de güvenli)
         kar = islem["toplam_fiyat"] - islem["toplam_maliyet"]
         self.c.execute(
-            "UPDATE Gunluk SET ciro = ciro - ?, kar = kar - ? WHERE id=1",
-            (islem["toplam_fiyat"], kar))
+            "UPDATE Gunluk SET ciro = ciro - ?, kar = kar - ?, "
+            "nakit_toplam = nakit_toplam - ?, kart_toplam = kart_toplam - ? WHERE id=1",
+            (islem["toplam_fiyat"], kar, islem["nakit_tutar"], islem["kart_tutar"]))
 
         # 3. Veresiyeyse: kaydı geri al
         if islem["tip"] == "veresiye":
@@ -2289,7 +2445,10 @@ class BufeSistemi(ctk.CTk):
         ctk.CTkLabel(ciro_kart, text="Toplam Ciro", font=(FONT_ANA, 14)).pack(pady=(10, 0))
         self.ciro_etiket = ctk.CTkLabel(ciro_kart, text="0.00 ₺",
                                          font=(FONT_ANA, 28, "bold"), text_color=RENK_MAVI)
-        self.ciro_etiket.pack(pady=(0, 10))
+        self.ciro_etiket.pack(pady=(0, 0))
+        self.nakit_kart_etiket = ctk.CTkLabel(ciro_kart, text="💵 0.00 ₺  /  💳 0.00 ₺",
+                                              font=(FONT_ANA, 12), text_color="#999")
+        self.nakit_kart_etiket.pack(pady=(0, 10))
 
         kar_kart = ctk.CTkFrame(info_frame, fg_color="#222",
                                  border_color=RENK_SARI, border_width=2)
@@ -2321,11 +2480,13 @@ class BufeSistemi(ctk.CTk):
         self.kapanis_etiketi.pack()
 
     def ozet_guncelle(self):
-        self.c.execute("SELECT ciro, kar FROM Gunluk WHERE id=1")
+        self.c.execute("SELECT ciro, kar, nakit_toplam, kart_toplam FROM Gunluk WHERE id=1")
         veri = self.c.fetchone()
         if veri:
             self.ciro_etiket.configure(text=self.format_tl(veri[0]))
             self.kar_etiket.configure(text=self.format_tl(veri[1]))
+            self.nakit_kart_etiket.configure(
+                text=f"💵 {self.format_tl(veri[2])}  /  💳 {self.format_tl(veri[3])}")
 
         self.c.execute(
             "SELECT isim, satilan_adet FROM Urunler WHERE satilan_adet > 0 "
@@ -2339,29 +2500,33 @@ class BufeSistemi(ctk.CTk):
         self.encok_satanlar_liste.configure(state="disabled")
 
         self.c.execute(
-            "SELECT tarih, ciro, kar FROM GunlukGecmis ORDER BY id DESC LIMIT 7")
+            "SELECT tarih, ciro, kar, nakit_toplam, kart_toplam FROM GunlukGecmis "
+            "ORDER BY id DESC LIMIT 7")
         gecmis = self.c.fetchall()
         self.gecmis_rapor_liste.configure(state="normal")
         self.gecmis_rapor_liste.delete("1.0", "end")
         if gecmis:
-            for tarih, ciro, kar in gecmis:
+            for tarih, ciro, kar, nakit, kart in gecmis:
                 self.gecmis_rapor_liste.insert(
                     "end",
-                    f"📅 {tarih}  |  Ciro: {self.format_tl(ciro)}  |  Kâr: {self.format_tl(kar)}\n")
+                    f"📅 {tarih}  |  Ciro: {self.format_tl(ciro)}  |  Kâr: {self.format_tl(kar)}  "
+                    f"|  💵 {self.format_tl(nakit)} / 💳 {self.format_tl(kart)}\n")
         else:
             self.gecmis_rapor_liste.insert("end", "Henüz kapanış raporu yok.\n")
         self.gecmis_rapor_liste.configure(state="disabled")
 
     def gunu_kapat(self):
-        self.c.execute("SELECT ciro, kar FROM Gunluk WHERE id=1")
+        self.c.execute("SELECT ciro, kar, nakit_toplam, kart_toplam FROM Gunluk WHERE id=1")
         veri = self.c.fetchone()
         if veri and veri[0] > 0:
             tarih = datetime.now().strftime("%d.%m.%Y %H:%M")
             self.c.execute(
-                "INSERT INTO GunlukGecmis (tarih, ciro, kar) VALUES (?, ?, ?)",
-                (tarih, veri[0], veri[1]))
+                "INSERT INTO GunlukGecmis (tarih, ciro, kar, nakit_toplam, kart_toplam) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tarih, veri[0], veri[1], veri[2], veri[3]))
 
-        self.c.execute("UPDATE Gunluk SET ciro = 0, kar = 0 WHERE id=1")
+        self.c.execute(
+            "UPDATE Gunluk SET ciro = 0, kar = 0, nakit_toplam = 0, kart_toplam = 0 WHERE id=1")
         self.c.execute("UPDATE Urunler SET satilan_adet = 0")
         self.conn.commit()
         self.ozet_guncelle()
